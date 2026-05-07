@@ -1,0 +1,40 @@
+# Senaiy Voice — Caddy reverse proxy
+# Replace senaiy.solvfast.com with your real domain.
+# Caddy auto-issues a Let's Encrypt cert on first start.
+
+senaiy.solvfast.com {
+    encode zstd gzip
+
+    # Reasonable defaults for a streaming voice app
+    request_body {
+        max_size 50MB
+    }
+
+    # Admin panel — strip /admin prefix before forwarding to FastAPI
+    handle_path /admin/* {
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Prefix /admin
+        }
+    }
+
+    # Twilio webhook + media stream — strip /twilio prefix.
+    # The bot is started with --proxy senaiy.solvfast.com/twilio so the TwiML
+    # it returns points Twilio at wss://senaiy.solvfast.com/twilio/ws which
+    # arrives here, gets stripped to /ws, and reaches the bot.
+    handle_path /twilio/* {
+        reverse_proxy 127.0.0.1:7861 {
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Browser bot at root (handles /, /client/*, /api/*, etc.)
+    handle {
+        reverse_proxy 127.0.0.1:7860 {
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+}

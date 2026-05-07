@@ -1,0 +1,27 @@
+[Unit]
+Description=Senaiy Voice — Twilio bot (port 7861)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=senaiy
+Group=senaiy
+WorkingDirectory=/opt/senaiy/server
+EnvironmentFile=/opt/senaiy/server/.env
+# PUBLIC_DOMAIN must be set in .env (e.g. PUBLIC_DOMAIN=senaiy.solvfast.com)
+ExecStart=/bin/sh -c '/opt/senaiy/server/.venv/bin/python bot.py --port 7861 --transport twilio --proxy ${PUBLIC_DOMAIN}/twilio'
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/senaiy/twilio.log
+StandardError=append:/var/log/senaiy/twilio.log
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/senaiy/server/data /var/log/senaiy
+
+[Install]
+WantedBy=multi-user.target

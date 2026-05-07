@@ -1,0 +1,26 @@
+[Unit]
+Description=Senaiy Voice — browser bot (SmallWebRTC, port 7860)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=senaiy
+Group=senaiy
+WorkingDirectory=/opt/senaiy/server
+EnvironmentFile=/opt/senaiy/server/.env
+ExecStart=/opt/senaiy/server/.venv/bin/python bot.py --port 7860
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/senaiy/web.log
+StandardError=append:/var/log/senaiy/web.log
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/senaiy/server/data /var/log/senaiy
+
+[Install]
+WantedBy=multi-user.target
