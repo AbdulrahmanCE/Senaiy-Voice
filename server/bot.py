@@ -184,11 +184,13 @@ async def run_bot(transport: BaseTransport, call_metadata: dict | None = None):
 
     # ─── Speech-to-Text ──────────────────────────────────────────────────
     if stt_provider == "deepgram":
+        # nova-3 supports Arabic + multilingual; older nova-2 does NOT support Arabic.
+        # STT_LANGUAGE=multi enables Arabic+English code-switching; "ar" locks to Arabic.
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
             live_options=LiveOptions(
-                model=os.getenv("DEEPGRAM_MODEL", "nova-2"),
-                language=os.getenv("STT_LANGUAGE", "ar"),
+                model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
+                language=os.getenv("STT_LANGUAGE", "multi"),
                 smart_format=True,
                 punctuate=True,
                 interim_results=True,
@@ -377,7 +379,10 @@ async def run_bot(transport: BaseTransport, call_metadata: dict | None = None):
         for fc in function_calls:
             logger.info(f"🔧 LLM TOOL CALL → {fc.function_name}({fc.arguments})")
 
-    # Log when tool result comes back
+    # Log when tool result comes back, and rewrite CANCELLED results so the
+    # LLM doesn't mistake them for a technical failure. Pipecat marks tools
+    # cancelled when the user interrupts during the bot's reply — recoverable
+    # by calling the same tool again with the same args.
     from pipecat.frames.frames import FunctionCallResultFrame
     _orig_push_frame = llm.push_frame
 
@@ -385,6 +390,21 @@ async def run_bot(transport: BaseTransport, call_metadata: dict | None = None):
         if isinstance(frame, FunctionCallResultFrame):
             res_preview = str(frame.result)[:300] if frame.result is not None else "None"
             logger.info(f"🔧 LLM TOOL RESULT ← {frame.function_name}: {res_preview}")
+            # Rewrite CANCELLED → instruction the LLM can act on
+            res_str = str(frame.result) if frame.result is not None else ""
+            if res_str.strip() in ("CANCELLED", "'CANCELLED'", '"CANCELLED"'):
+                logger.warning(
+                    f"   ↳ Tool {frame.function_name} was CANCELLED by user interruption — "
+                    f"rewriting result to nudge the LLM to retry silently"
+                )
+                frame.result = (
+                    "TOOL_CANCELLED_BY_USER_INTERRUPTION: This is NOT a technical "
+                    "failure. The user spoke before your previous reply finished, "
+                    "which cancelled this tool. Call the SAME tool again with the "
+                    "SAME arguments, and do it SILENTLY (no acknowledgement before "
+                    "the call). Do not apologize. Do not say there was a technical "
+                    "issue. Just retry."
+                )
         return await _orig_push_frame(frame, *a, **kw)
     llm.push_frame = _logged_push_frame
 
