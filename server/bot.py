@@ -26,6 +26,7 @@ from pipecat.runner.types import RunnerArguments
 import datetime
 from pipecat.services.openai.stt import OpenAISTTService  # kept for fallback / reference
 from pipecat.services.soniox.stt import SonioxSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.pipeline.pipeline import Pipeline
@@ -173,58 +174,91 @@ async def run_bot(transport: BaseTransport, call_metadata: dict | None = None):
     )
     recording_path_holder = {"path": None}
 
-    # Speech-to-Text service — OpenAI Whisper locked to Arabic.
-    # The auto-detect mode used to mistakenly transcribe Saudi-accented speech
-    # as Spanish/German. Forcing language="ar" eliminates that. English product
-    # names mixed into Arabic (ComplAI, Care Fast) get transliterated, which is
-    # acceptable since the LLM understands them either way.
-    stt = OpenAISTTService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        language=Language.AR,
-    )
+    # ─── Provider selection ──────────────────────────────────────────────
+    # Switch any of LLM / STT / TTS provider via env. Defaults match the
+    # current production config (Gemini + Deepgram + ElevenLabs Turbo).
+    stt_provider = (os.getenv("STT_PROVIDER", "deepgram") or "deepgram").lower()
+    tts_provider = (os.getenv("TTS_PROVIDER", "elevenlabs") or "elevenlabs").lower()
+    llm_provider = (os.getenv("LLM_PROVIDER", "gemini") or "gemini").lower()
+    logger.info(f"Providers — LLM:{llm_provider}  STT:{stt_provider}  TTS:{tts_provider}")
 
-    # Text-to-Speech service
+    # ─── Speech-to-Text ──────────────────────────────────────────────────
+    if stt_provider == "deepgram":
+        stt = DeepgramSTTService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            live_options=LiveOptions(
+                model=os.getenv("DEEPGRAM_MODEL", "nova-2"),
+                language=os.getenv("STT_LANGUAGE", "ar"),
+                smart_format=True,
+                punctuate=True,
+                interim_results=True,
+                endpointing=300,
+            ),
+        )
+    elif stt_provider == "soniox":
+        stt = SonioxSTTService(
+            api_key=os.getenv("SONIOX_API_KEY"),
+            settings=SonioxSTTService.Settings(
+                language_hints=[Language.AR, Language.EN],
+                language_hints_strict=True,
+            ),
+        )
+    else:  # openai / whisper
+        stt = OpenAISTTService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            language=Language(os.getenv("STT_LANGUAGE", "ar")),
+        )
+
+    # ─── Text-to-Speech ──────────────────────────────────────────────────
     aiohttp_session = aiohttp.ClientSession()
-    _eleven_model = os.getenv("ELEVENLABS_MODEL", "eleven_v3")
-    tts = ElevenLabsHttpTTSService(
+    if tts_provider == "openai":
+        tts = OpenAITTSService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAITTSService.Settings(
+                voice=os.getenv("OPENAI_VOICE_ID", "alloy"),
+                speed=float(os.getenv("TTS_SPEED", "1.0")),
+            ),
+        )
+    else:  # elevenlabs
+        _eleven_model = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+        tts = ElevenLabsHttpTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             aiohttp_session=aiohttp_session,
             settings=ElevenLabsHttpTTSService.Settings(
                 voice=os.getenv("ELEVENLABS_VOICE_ID"),
                 model=_eleven_model,
-                speed=float(os.getenv("TTS_SPEED", "1.2")),
+                speed=float(os.getenv("TTS_SPEED", "1.0")),
             ),
         )
+        # eleven_v3 rejects requests that include previous_text or next_text
+        # params. Other models support them. Patch only when on v3.
+        if _eleven_model == "eleven_v3":
+            _no_continuity = property(lambda self: "", lambda self, v: None)
+            type(tts)._previous_text = _no_continuity
+            try:
+                type(tts)._next_text = _no_continuity
+            except Exception:
+                pass
+            logger.info("ElevenLabs eleven_v3 detected — disabling previous_text/next_text continuity")
 
-    # eleven_v3 rejects requests that include previous_text or next_text params
-    # (multi-sentence streaming continuity). Force them off so sentences 2..N
-    # don't fail with "unsupported_model". Without this the bot only plays the
-    # first sentence of every reply.
-    if _eleven_model == "eleven_v3":
-        # The service appends to self._previous_text after each TTS call and
-        # checks `if self._previous_text` before adding to the payload. Bypass
-        # by making the attribute always read empty.
-        _no_continuity = property(lambda self: "", lambda self, v: None)
-        type(tts)._previous_text = _no_continuity
-        try:
-            type(tts)._next_text = _no_continuity
-        except Exception:
-            pass
-        logger.info("ElevenLabs eleven_v3 detected — disabling previous_text/next_text continuity")
-
-
-    # LLM service — Google Gemini.
-    # Better Saudi-dialect compliance than gpt-4o in our testing. MCPClient.register_tools(llm)
-    # works identically with Gemini (Pipecat's gemini_adapter converts ToolsSchema).
+    # ─── LLM ─────────────────────────────────────────────────────────────
     _llm_settings_kwargs = {
-        "model": os.getenv("LLM_MODEL", "gemini-2.5-flash"),
         "system_instruction": load_prompt(),
     }
     if os.getenv("LLM_MAX_TOKENS"):
         _llm_settings_kwargs["max_tokens"] = int(os.getenv("LLM_MAX_TOKENS"))
     if os.getenv("LLM_TEMPERATURE"):
         _llm_settings_kwargs["temperature"] = float(os.getenv("LLM_TEMPERATURE"))
-    llm = GoogleLLMService(
+
+    if llm_provider == "openai":
+        _llm_settings_kwargs["model"] = os.getenv("LLM_MODEL", "gpt-4o")
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMService.Settings(**_llm_settings_kwargs),
+        )
+    else:  # gemini
+        _llm_settings_kwargs["model"] = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+        llm = GoogleLLMService(
             api_key=os.getenv("GOOGLE_AI_API_KEY"),
             settings=GoogleLLMService.Settings(**_llm_settings_kwargs),
         )
