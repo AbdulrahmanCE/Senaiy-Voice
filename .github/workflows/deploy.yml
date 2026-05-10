@@ -1,0 +1,75 @@
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: actions  # secrets live under the 'actions' GitHub environment
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Verify Python files compile (cheap pre-flight)
+        run: |
+          python3 -m compileall -q server/bot.py server/admin.py server/db.py
+
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync server/ to /opt/senaiy/server
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          rsync -az --delete \
+            --exclude '.venv/' \
+            --exclude 'data/' \
+            --exclude 'recordings/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude '.env' \
+            --exclude 'prompts/_tools.md' \
+            -e "ssh -o StrictHostKeyChecking=accept-new" \
+            ./server/ "$DEPLOY_USER@$DEPLOY_HOST:/opt/senaiy/server/"
+
+      - name: Rsync deploy/ kit
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -o StrictHostKeyChecking=accept-new" \
+            ./deploy/ "$DEPLOY_USER@$DEPLOY_HOST:/opt/senaiy/deploy/"
+
+      - name: Run deploy script (uv sync + branding + restart)
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "$DEPLOY_USER@$DEPLOY_HOST" \
+            'bash /opt/senaiy/bin/deploy.sh'
+
+      - name: Tail deploy log on failure for visibility
+        if: failure()
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "$DEPLOY_USER@$DEPLOY_HOST" \
+            'tail -100 /var/log/senaiy/deploy.log || true; tail -50 /var/log/senaiy/web.log || true' || true
