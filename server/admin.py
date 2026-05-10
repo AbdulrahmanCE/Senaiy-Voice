@@ -35,6 +35,24 @@ ENV_PATH = ROOT / ".env"
 
 app = FastAPI(title="Senaiy Admin")
 app.add_middleware(SessionMiddleware, secret_key=ADMIN_SECRET_KEY, max_age=60 * 60 * 24)
+
+
+@app.middleware("http")
+async def _prepend_root_path_to_redirects(request: Request, call_next):
+    """When mounted under a path prefix (e.g. /admin via --root-path), our
+    RedirectResponse('/foo') would send the browser to /foo on the public host
+    instead of /admin/foo. Rewrite Location headers that start with '/' to
+    include the root_path prefix.
+    """
+    response = await call_next(request)
+    root_path = request.scope.get("root_path", "")
+    if root_path and 300 <= response.status_code < 400:
+        loc = response.headers.get("location")
+        if loc and loc.startswith("/") and not loc.startswith(root_path + "/") and loc != root_path:
+            response.headers["location"] = root_path + loc
+    return response
+
+
 _db.init_db()
 
 
@@ -47,6 +65,37 @@ def is_authed(request: Request) -> bool:
 def require_admin(request: Request):
     if not is_authed(request):
         raise HTTPException(status_code=302, headers={"Location": "/login"})
+
+
+import re as _re
+
+# Matches href="/...", action="/...", src="/..." for any internal absolute
+# path. Negative lookahead `(?!/)` skips protocol-relative URLs like //host.
+_INTERNAL_URL_RE = _re.compile(r'(\b(?:href|action|src)=)(["\'])/(?!/)')
+
+
+def _prefix_internal_urls(html: str, root_path: str) -> str:
+    """Rewrite href="/..." / action="/..." / src="/..." to include root_path.
+
+    Skips: external URLs (//host or https://...). Already-prefixed paths get
+    re-prefixed because the regex doesn't peek deeper, but we guard against
+    double-prefixing in the replacement: if root_path already follows /, skip.
+    """
+    if not root_path:
+        return html
+    rp = root_path.rstrip("/")
+
+    def _sub(m: _re.Match) -> str:
+        # m.group(0) == 'href="/' (or action= / src=)
+        # Avoid double-prefixing if the path already starts with our root_path
+        rest_start = m.end()
+        # Check if the next chars are exactly the root_path segment (e.g. "admin/")
+        nxt = html[rest_start:rest_start + len(rp)]
+        if nxt == rp.lstrip("/"):  # already prefixed
+            return m.group(0)
+        return f'{m.group(1)}{m.group(2)}{rp}/'
+
+    return _INTERNAL_URL_RE.sub(_sub, html)
 
 
 def page(title: str, body: str, request: Request | None = None) -> str:
@@ -64,7 +113,8 @@ def page(title: str, body: str, request: Request | None = None) -> str:
             '<button class="logout">Logout</button></form>'
             "</nav>"
         )
-    return f"""<!doctype html>
+    root_path = request.scope.get("root_path", "") if request else ""
+    html = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -118,6 +168,7 @@ button.primary:hover {{ filter:brightness(1.1); }}
 </main>
 </body>
 </html>"""
+    return _prefix_internal_urls(html, root_path)
 
 
 def fmt_time(iso: str | None) -> str:
@@ -476,13 +527,16 @@ def env_restart(request: Request):
     import subprocess
     import signal
 
-    # Try systemd first (production)
+    # Try systemd first (production). Uses sudo because the admin runs as the
+    # unprivileged 'senaiy' user; sudoers.d/senaiy-restart whitelists these.
     if shutil.which("systemctl") and Path("/etc/systemd/system/senaiy-admin.service").exists():
         try:
-            subprocess.run(["systemctl", "restart", "senaiy-web", "senaiy-twilio"],
-                           timeout=15, check=False)
-            # Restart admin LAST since it kills our own process
-            subprocess.Popen(["systemctl", "restart", "senaiy-admin"])
+            for svc in ("senaiy-web", "senaiy-twilio"):
+                subprocess.run(["sudo", "-n", "/bin/systemctl", "restart", svc],
+                               timeout=15, check=False)
+            # Restart admin LAST since it kills our own process. Detach so the
+            # response can flush before our process dies.
+            subprocess.Popen(["sudo", "-n", "/bin/systemctl", "restart", "senaiy-admin"])
             return RedirectResponse("/env?msg=Restart+triggered+via+systemd", status_code=302)
         except Exception as e:
             return RedirectResponse(f"/env?reveal=0&error=systemctl+restart+failed:+{h(str(e))}", status_code=302)

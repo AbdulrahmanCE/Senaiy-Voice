@@ -9,18 +9,20 @@ User=senaiy
 Group=senaiy
 WorkingDirectory=/opt/senaiy/server
 EnvironmentFile=/opt/senaiy/server/.env
-ExecStart=/opt/senaiy/server/.venv/bin/uvicorn admin:app --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips '*'
+ExecStart=/opt/senaiy/server/.venv/bin/uvicorn admin:app --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips '*' --root-path /admin
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/senaiy/admin.log
 StandardError=append:/var/log/senaiy/admin.log
 
 # Hardening
-NoNewPrivileges=true
+# NoNewPrivileges left OFF for admin so sudo can restart sibling services
+# (whitelisted in /etc/sudoers.d/senaiy-restart). Other hardening remains.
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/senaiy/server/data /opt/senaiy/server/prompts /var/log/senaiy
+ReadWritePaths=/opt/senaiy/server /var/log/senaiy
 
 [Install]
 WantedBy=multi-user.target

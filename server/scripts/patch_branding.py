@@ -9,11 +9,20 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DIST = ROOT / ".venv/lib/python3.11/site-packages/pipecat_ai_small_webrtc_prebuilt/client/dist"
 LOGO_PNG = ROOT / "static/logo.png"
 
-if not DIST.exists():
-    sys.exit(f"prebuilt dist not found at {DIST} — run `uv sync` first")
+# Discover the active python lib dir under .venv (works for any python version)
+VENV_LIB = ROOT / ".venv/lib"
+DIST = None
+if VENV_LIB.exists():
+    for d in sorted(VENV_LIB.iterdir()):
+        cand = d / "site-packages/pipecat_ai_small_webrtc_prebuilt/client/dist"
+        if cand.exists():
+            DIST = cand
+            break
+
+if DIST is None or not DIST.exists():
+    sys.exit(f"prebuilt dist not found under {VENV_LIB} — run `uv sync` first")
 if not LOGO_PNG.exists():
     sys.exit(f"logo not found at {LOGO_PNG}")
 
